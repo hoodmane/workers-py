@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 from workers import WorkflowEntrypoint
@@ -19,6 +20,8 @@ class TestWorkflow(WorkflowEntrypoint):
             "retry": self._retry,
             "non_retryable": self._non_retryable,
             "catch_error": self._catch_error,
+            "duplicate_step_names": self._duplicate_step_names,
+            "step_output_conversion": self._step_output_conversion,
         }
         handler = handlers.get(mode)
         if handler is None:
@@ -106,14 +109,71 @@ class TestWorkflow(WorkflowEntrypoint):
         return await flaky()
 
     async def _non_retryable(self, event, step):
+        # Fails on the first attempt with NonRetryableError and would succeed on a
+        # second attempt. If the engine honours NonRetryableError the step fails
+        # once and `run()` sees a NonRetryableError; if the engine retries, the step
+        # completes with `attempt == 2`.
         @step.do(
             "non-retryable-step",
-            config={"retries": {"limit": 1, "delay": 0, "backoff": "constant"}},
+            config={"retries": {"limit": 3, "delay": 0, "backoff": "constant"}},
         )
-        async def boom():
-            raise NonRetryableError("do not retry")
+        async def boom(ctx):
+            if int(ctx["attempt"]) < 2:
+                raise NonRetryableError("do not retry")
+            return {"retried": True, "attempt": int(ctx["attempt"])}
 
-        return await boom()
+        try:
+            result = await boom()
+        except NonRetryableError as exc:
+            return {
+                "retried": False,
+                "caught": "NonRetryableError",
+                "message": str(exc),
+            }
+        except Exception as exc:
+            return {"retried": False, "caught": type(exc).__name__, "message": str(exc)}
+        return result
+
+    async def _duplicate_step_names(self, event, step):
+        # The engine disambiguates repeated step names with a counter, so two
+        # steps sharing a name must not share memoised results or in-flight tasks.
+        @step.do("dup")
+        async def first():
+            return 1
+
+        @step.do("dup")
+        async def second():
+            return 2
+
+        # Implicit dependencies resolve by step name, so `dup` refers to the most
+        # recently registered closure (`second`) and must return its result.
+        @step.do()
+        async def uses(dup):
+            return dup * 10
+
+        # Run both same-named steps concurrently so they are in flight together.
+        concurrent = list(await asyncio.gather(first(), second()))
+        return {"concurrent": concurrent, "uses": await uses()}
+
+    async def _step_output_conversion(self, event, step):
+        @step.do("produce")
+        async def produce():
+            return {
+                "when": datetime.datetime(2026, 1, 2, 3, 4, 5),
+                "nothing": None,
+                "nested": {"nothing": None},
+            }
+
+        @step.do()
+        async def consume(produce):
+            return {
+                "when_is_datetime": isinstance(produce["when"], datetime.datetime),
+                "year": produce["when"].year,
+                "nothing_is_none": produce["nothing"] is None,
+                "nested_nothing_is_none": produce["nested"]["nothing"] is None,
+            }
+
+        return await consume()
 
     async def _catch_error(self, event, step):
         @step.do(

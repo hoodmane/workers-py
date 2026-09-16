@@ -146,10 +146,33 @@ async def test_step_retry_config(env):
     assert status["output"]["succeeded_on_attempt"] == 2
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Requires a workerd that translates a Python NonRetryableError raised in a "
+        "step into a JS error named 'NonRetryableError' before it reaches the "
+        "Workflows engine (see wrapWorkflowStep in workerd's "
+        "python-entrypoint-helper.ts). Until wrangler ships that runtime the error "
+        "arrives as a generic PythonError and the step is retried. Remove this "
+        "marker once the test starts passing."
+    ),
+)
 async def test_non_retryable_error(env):
     instance = await env.MY_WORKFLOW.create({"params": {"mode": "non_retryable"}})
     status = await _poll(instance)
-    assert status["status"] == "errored", f"unexpected status: {dict(status)!r}"
+    assert status["status"] == "complete", f"unexpected status: {dict(status)!r}"
+    out = status["output"]
+    # The step would succeed on attempt 2, so `retried` means the engine ignored
+    # the NonRetryableError.
+    assert out["retried"] is False, f"step was retried: {out!r}"
+    # ...and the error must come back to `run()` as a Python NonRetryableError.
+    assert out["caught"] == "NonRetryableError", out
+    # The message is preserved by the runtime (covered by workerd's
+    # workflow-entrypoint test), but miniflare currently truncates error messages
+    # crossing from the Python worker into its Workflows engine at the first ": "
+    # (pre-existing: it also reduced "PythonError: Traceback ..." to "PythonError"),
+    # so accept an empty message here.
+    assert out["message"] in ("do not retry", ""), out
 
 
 async def test_error_handling_catch(env):
@@ -159,9 +182,34 @@ async def test_error_handling_catch(env):
     # Per the docs, a step error propagates to run() and is catchable with
     # `except Exception`. Neither the concrete type nor the original message is
     # guaranteed to survive the RPC layer, so we assert the reliable contract:
-    # the error was caught and a message was produced.
+    # the error was caught and a message was produced, and that the SDK's own
+    # error translation did not blow up (e.g. IndexError while parsing it).
     assert status["output"]["caught"] is not None
+    assert status["output"]["caught"] != "IndexError"
     assert status["output"]["message"]
+
+
+async def test_duplicate_step_names(env):
+    instance = await env.MY_WORKFLOW.create(
+        {"params": {"mode": "duplicate_step_names"}}
+    )
+    status = await _poll(instance)
+    assert status["status"] == "complete", f"unexpected status: {dict(status)!r}"
+    assert status["output"]["concurrent"] == [1, 2]
+    assert status["output"]["uses"] == 20
+
+
+async def test_step_output_conversion(env):
+    instance = await env.MY_WORKFLOW.create(
+        {"params": {"mode": "step_output_conversion"}}
+    )
+    status = await _poll(instance)
+    assert status["status"] == "complete", f"unexpected status: {dict(status)!r}"
+    out = status["output"]
+    assert out["when_is_datetime"] is True
+    assert out["year"] == 2026
+    assert out["nothing_is_none"] is True
+    assert out["nested_nothing_is_none"] is True
 
 
 # The tests below pass pre-converted (to_js) objects, the legacy pattern from the

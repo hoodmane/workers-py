@@ -116,7 +116,11 @@ class _WorkflowStepWrapper:
                     func, depends, implicit
                 )
                 results = await self._gather_results(results_future_list, concurrent)
-                return await _do_call(self, step_name, config, func, *results)
+                # Memoisation is keyed by the closure object rather than by the step
+                # name: the engine allows the same name to be used more than once
+                # (it disambiguates with a counter), so two steps sharing a name
+                # must not share results or in-flight tasks.
+                return await _do_call(self, step_name, wrapper, config, func, *results)
 
             wrapper._step_name = step_name
             self.step_closures[step_name] = wrapper
@@ -157,7 +161,13 @@ class _WorkflowStepWrapper:
                 if p.name == "ctx":
                     results_future_list.append(p)
                 else:
-                    results_future_list.append(depends[curr])
+                    dep = depends[curr]
+                    if not hasattr(dep, "_step_name"):
+                        raise TypeError(
+                            f"'depends' entry for parameter {p.name!r} is not a "
+                            "function decorated with step.do"
+                        )
+                    results_future_list.append(dep)
                     curr += 1
 
         return results_future_list
@@ -194,17 +204,17 @@ class _WorkflowStepWrapper:
         )
 
     async def _resolve_dependency(self, dep):
-        if hasattr(dep, "name") and dep.name == "ctx":
+        if isinstance(dep, inspect.Parameter) and dep.name == "ctx":
             return dep
-        elif dep._step_name in self._memoized_dependencies:
-            return self._memoized_dependencies[dep._step_name]
-        elif dep._step_name in self._in_flight:
-            return await self._in_flight[dep._step_name]
+        elif dep in self._memoized_dependencies:
+            return self._memoized_dependencies[dep]
+        elif dep in self._in_flight:
+            return await self._in_flight[dep]
 
         return await dep()
 
 
-async def _do_call(entrypoint, name, config, callback, *results):
+async def _do_call(entrypoint, name, key, config, callback, *results):
     async def _callback(ctx=None):
         # deconstruct the actual ctx object
         resolved_results = tuple(
@@ -217,7 +227,9 @@ async def _do_call(entrypoint, name, config, callback, *results):
 
         if inspect.iscoroutine(result):
             result = await result
-        return to_js(result, dict_converter=Object.fromEntries)
+        # The step result crosses the RPC boundary back to the Workflows engine, so
+        # convert it the same way as the value returned from `run()`.
+        return python_to_rpc(result)
 
     async def _closure():
         try:
@@ -233,13 +245,13 @@ async def _do_call(entrypoint, name, config, callback, *results):
             raise _from_js_error(exc) from exc
 
     task = create_task(_closure())
-    entrypoint._in_flight[name] = task
+    entrypoint._in_flight[key] = task
 
     try:
         result = await task
-        entrypoint._memoized_dependencies[name] = result
+        entrypoint._memoized_dependencies[key] = result
     finally:
-        del entrypoint._in_flight[name]
+        entrypoint._in_flight.pop(key, None)
 
     return result
 

@@ -144,14 +144,36 @@ def _to_python_exception(exc: JsException) -> Exception:
         return exc
 
 
+_NON_RETRYABLE_ERROR_NAME = "NonRetryableError"
+
+
 def _from_js_error(exc: JsException) -> Exception:
     # convert into Python exception after a full round trip
     # Python - JS - Python
-    if not exc.message or not exc.message.startswith("PythonError"):
+    message = exc.message or ""
+
+    # A NonRetryableError raised inside a workflow step is translated by the runtime
+    # into a JS error named "NonRetryableError" before it reaches the Workflows
+    # engine, which is how the engine knows not to retry the step. When the engine
+    # rethrows it back to us the name either survives, or (without enhanced error
+    # serialization) is folded into the message as a prefix.
+    if getattr(exc, "name", None) == _NON_RETRYABLE_ERROR_NAME:
+        return NonRetryableError(message)
+    if message == _NON_RETRYABLE_ERROR_NAME:
+        return NonRetryableError()
+    if message.startswith(_NON_RETRYABLE_ERROR_NAME + ": "):
+        return NonRetryableError(message[len(_NON_RETRYABLE_ERROR_NAME) + 2 :])
+
+    if not message.startswith("PythonError"):
         return _to_python_exception(exc)
 
-    # extract the Python exception type from the traceback
-    error_message_last_line = exc.message.split("\n")[-2]
+    # extract the Python exception type from the traceback. The message may have
+    # been stripped down to just "PythonError" when crossing an RPC boundary, in
+    # which case there is no traceback to inspect.
+    lines = exc.message.split("\n")
+    if len(lines) < 2:
+        return _to_python_exception(exc)
+    error_message_last_line = lines[-2]
     if error_message_last_line.startswith("TypeError"):
         return TypeError(error_message_last_line)
     elif error_message_last_line.startswith("ValueError"):
