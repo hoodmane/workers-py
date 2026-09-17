@@ -126,6 +126,43 @@ def import_from_javascript(module_name: str) -> Any:
         raise
 
 
+# Directory, relative to the worker bundle root, that `pywrangler sync` vendors Python packages
+# into. wrangler registers `.js`/`.mjs` files found under `python_modules/workers/` as ES modules
+# (everything else in `python_modules/` is opaque data), which is what lets them be imported via
+# `import_from_javascript`.
+_SDK_JS_MODULE_PREFIX = "python_modules/workers/"
+
+
+def import_sdk_javascript_module(name: str) -> Any:
+    """
+    Import a JavaScript module that ships inside this SDK's ``workers`` package.
+
+    Args:
+        name: File name of the module relative to ``workers/``, e.g. ``"hello.js"``.
+
+    Returns:
+        The imported module object.
+
+    Example:
+        hello = import_sdk_javascript_module("hello.js")
+        assert hello.text == "Hello from JavaScript!"
+    """
+    return import_from_javascript(_SDK_JS_MODULE_PREFIX + name)
+
+
+async def import_sdk_javascript_module_async(name: str) -> Any:
+    """
+    Asynchronous variant of :func:`import_sdk_javascript_module`.
+
+    Unlike the synchronous version this does not rely on JSPI, so it also works on runtimes
+    without ``pyodide.ffi.run_sync`` as long as the caller is already in an async context.
+    """
+    try:
+        return await _pyodide_entrypoint_helper.doAnImport(_SDK_JS_MODULE_PREFIX + name)
+    except JsException as e:
+        raise ImportError(f"Failed to import '{name}': {e}") from e
+
+
 @contextmanager
 def patch_env(
     d: dict[str, Any] | Sequence[tuple[str, Any]] | None = None, **kwds: dict[str, Any]
@@ -164,16 +201,22 @@ def _from_js_error(exc: JsException) -> Exception:
     if message.startswith(_NON_RETRYABLE_ERROR_NAME + ": "):
         return NonRetryableError(message[len(_NON_RETRYABLE_ERROR_NAME) + 2 :])
 
-    if not message.startswith("PythonError"):
+    # A Python exception that escaped to JS is a Pyodide `PythonError` whose message
+    # is the formatted traceback. Depending on how it was serialized over RPC it
+    # either keeps its name (enhanced error serialization) or arrives as a plain
+    # `Error` with "PythonError: " folded into the message.
+    if getattr(exc, "name", None) != "PythonError" and not message.startswith(
+        "PythonError"
+    ):
         return _to_python_exception(exc)
 
-    # extract the Python exception type from the traceback. The message may have
-    # been stripped down to just "PythonError" when crossing an RPC boundary, in
-    # which case there is no traceback to inspect.
-    lines = exc.message.split("\n")
+    # extract the Python exception type from the last line of the traceback. The
+    # message may have been stripped down to just "PythonError" when crossing an RPC
+    # boundary, in which case there is no traceback to inspect.
+    lines = message.rstrip().split("\n")
     if len(lines) < 2:
         return _to_python_exception(exc)
-    error_message_last_line = lines[-2]
+    error_message_last_line = lines[-1]
     if error_message_last_line.startswith("TypeError"):
         return TypeError(error_message_last_line)
     elif error_message_last_line.startswith("ValueError"):

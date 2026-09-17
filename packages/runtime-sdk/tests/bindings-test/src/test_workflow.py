@@ -146,17 +146,6 @@ async def test_step_retry_config(env):
     assert status["output"]["succeeded_on_attempt"] == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Requires a workerd that translates a Python NonRetryableError raised in a "
-        "step into a JS error named 'NonRetryableError' before it reaches the "
-        "Workflows engine (see wrapWorkflowStep in workerd's "
-        "python-entrypoint-helper.ts). Until wrangler ships that runtime the error "
-        "arrives as a generic PythonError and the step is retried. Remove this "
-        "marker once the test starts passing."
-    ),
-)
 async def test_non_retryable_error(env):
     instance = await env.MY_WORKFLOW.create({"params": {"mode": "non_retryable"}})
     status = await _poll(instance)
@@ -167,11 +156,11 @@ async def test_non_retryable_error(env):
     assert out["retried"] is False, f"step was retried: {out!r}"
     # ...and the error must come back to `run()` as a Python NonRetryableError.
     assert out["caught"] == "NonRetryableError", out
-    # The message is preserved by the runtime (covered by workerd's
-    # workflow-entrypoint test), but miniflare currently truncates error messages
-    # crossing from the Python worker into its Workflows engine at the first ": "
-    # (pre-existing: it also reduced "PythonError: Traceback ..." to "PythonError"),
-    # so accept an empty message here.
+    # The message is preserved end to end in workerd (covered by the `workflow`
+    # workerd-test), but miniflare currently truncates error messages crossing from
+    # the Python worker into its Workflows engine at the first ": " (pre-existing:
+    # it also reduced "PythonError: Traceback ..." to "PythonError"), so accept an
+    # empty message here.
     assert out["message"] in ("do not retry", ""), out
 
 

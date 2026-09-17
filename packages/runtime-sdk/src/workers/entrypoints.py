@@ -17,7 +17,11 @@ from .rpc import (
     python_from_rpc,
     python_to_rpc,
 )
-from .utils import _from_js_error, _is_js_instance
+from .utils import (
+    _from_js_error,
+    _is_js_instance,
+    import_sdk_javascript_module_async,
+)
 
 if TYPE_CHECKING:
     from js import DurableObjectState, Env, ExecutionContext
@@ -116,10 +120,6 @@ class _WorkflowStepWrapper:
                     func, depends, implicit
                 )
                 results = await self._gather_results(results_future_list, concurrent)
-                # Memoisation is keyed by the closure object rather than by the step
-                # name: the engine allows the same name to be used more than once
-                # (it disambiguates with a counter), so two steps sharing a name
-                # must not share results or in-flight tasks.
                 return await _do_call(self, step_name, wrapper, config, func, *results)
 
             wrapper._step_name = step_name
@@ -299,6 +299,26 @@ def _wrap_class(cls):
     return cls
 
 
+_workflows_js_module = None
+
+
+async def _wrap_js_workflow_step(js_step):
+    """
+    Wrap the JS `WorkflowStep` stub with `wrapWorkflowStep` from the SDK's `workflows.js`.
+
+    The wrapper makes a Python `NonRetryableError` raised inside a step reach the Workflows
+    engine as a JS error the engine recognises as non-retryable (see `workflows.js`). If the
+    module is not available (e.g. the SDK was bundled without its JavaScript files) the raw stub
+    is used and steps behave as before.
+    """
+    global _workflows_js_module  # noqa: PLW0603
+    if _workflows_js_module is None:
+        _workflows_js_module = await import_sdk_javascript_module_async(
+            "workflows.js"
+        )
+    return _workflows_js_module.wrapWorkflowStep(js_step)
+
+
 def _wrap_workflow_step(cls):
     run_fn = cls.__dict__.get("run")
     if run_fn is None:
@@ -309,7 +329,7 @@ def _wrap_workflow_step(cls):
         if event is not None:
             event = python_from_rpc(event)
         if step is not None:
-            step = _WorkflowStepWrapper(step)
+            step = _WorkflowStepWrapper(await _wrap_js_workflow_step(step))
 
         result = run_fn(self, event, step, *args, **kwargs)
 
